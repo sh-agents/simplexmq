@@ -26,6 +26,7 @@ module Simplex.Messaging.Server.Env.STM
     StorePaths (..),
     StartOptions (..),
     Env (..),
+    M,
     Server (..),
     ServerSubscribers (..),
     SubscribedClients,
@@ -67,6 +68,7 @@ module Simplex.Messaging.Server.Env.STM
     defaultInactiveClientExpiration,
     defaultProxyClientConcurrency,
     defaultNameResolverConcurrency,
+    defaultForwardWorkers,
     defaultMaxClientCmdWait,
     defaultAuthErrorDelayMs,
     readWriteQueueStore,
@@ -80,6 +82,7 @@ where
 import Control.Concurrent (ThreadId)
 import Control.Logger.Simple
 import Control.Monad
+import Control.Monad.Reader (ReaderT)
 import qualified Crypto.PubKey.RSA as RSA
 import Crypto.Random
 import Data.Int (Int64)
@@ -177,6 +180,7 @@ data ServerConfig s = ServerConfig
     prometheusMetricsFile :: FilePath,
     -- | notification delivery interval
     ntfDeliveryInterval :: Int,
+    ntfDeliveryChunk :: Int,
     -- | interval between sending pending END events to unsubscribed clients, seconds
     pendingENDInterval :: Int,
     authErrorDelay :: Int64,
@@ -197,6 +201,7 @@ data ServerConfig s = ServerConfig
     -- aggregate over a single proxy->relay connection (only servers send proxied
     -- requests), so bounding them by the per-client limit would throttle unduly.
     serverResolverConcurrency :: Int,
+    serverForwardWorkers :: Int,
     maxClientCmdWait :: Int,
     -- | public-namespace resolver config; Nothing disables the names role
     namesConfig :: Maybe NamesConfig,
@@ -246,6 +251,9 @@ defaultProxyClientConcurrency = 500
 defaultNameResolverConcurrency :: Int
 defaultNameResolverConcurrency = 5000
 
+defaultForwardWorkers :: Int
+defaultForwardWorkers = 8
+
 defaultMaxClientCmdWait :: Int
 defaultMaxClientCmdWait = 60000000 -- microseconds
 
@@ -272,6 +280,8 @@ data Env s = Env
     proxyAgent :: ProxyAgent, -- senders served on this proxy
     namesEnv :: Maybe NamesEnv -- public-namespace resolver, present when [NAMES] enable: on
   }
+
+type M s a = ReaderT (Env s) IO a
 
 msgStore :: Env s -> s
 msgStore = fromMsgStore . msgStore_
@@ -347,8 +357,7 @@ data Server s = Server
 newtype ServerClients s = ServerClients {serverClients :: TVar (IntMap (Client s))}
 
 data ServerSubscribers s = ServerSubscribers
-  { subQ :: TQueue (ClientSub, ClientId),
-    queueSubscribers :: SubscribedClients s,
+  { queueSubscribers :: SubscribedClients s,
     serviceSubscribers :: SubscribedClients s, -- service clients with long-term certificates that have subscriptions
     totalServiceSubs :: TVar (Int64, IdsHash),
     subClients :: TVar IntSet, -- clients with individual or service subscriptions
@@ -433,6 +442,7 @@ data Client s = Client
     sndQ :: TBQueue (NonEmpty (Transmission BrokerMsg), [Transmission BrokerMsg]),
     msgQ :: TBQueue (NonEmpty (Transmission BrokerMsg)),
     procThreads :: TVar Int,
+    fwdWorkers :: TVar (IntMap (TBQueue (M s ()))),
     endThreads :: TVar (IntMap (Weak ThreadId)),
     endThreadSeq :: TVar Int,
     clientTHParams :: THandleParams SMPVersion 'TServer,
@@ -486,13 +496,12 @@ deleteServerClient cId Server {clients} = atomically $ modifyTVar' (serverClient
 
 newServerSubscribers :: IO (ServerSubscribers s)
 newServerSubscribers = do
-  subQ <- newTQueueIO
   queueSubscribers <- SubscribedClients <$> TM.emptyIO
   serviceSubscribers <- SubscribedClients <$> TM.emptyIO
   totalServiceSubs <- newTVarIO (0, mempty)
   subClients <- newTVarIO IS.empty
   pendingEvents <- newTVarIO IM.empty
-  pure ServerSubscribers {subQ, queueSubscribers, serviceSubscribers, totalServiceSubs, subClients, pendingEvents}
+  pure ServerSubscribers {queueSubscribers, serviceSubscribers, totalServiceSubs, subClients, pendingEvents}
 
 newClient :: ClientId -> Natural -> THandleParams SMPVersion 'TServer -> SystemTime -> IO (Client s)
 newClient clientId qSize clientTHParams createdAt = do
@@ -506,6 +515,7 @@ newClient clientId qSize clientTHParams createdAt = do
   sndQ <- newTBQueueIO qSize
   msgQ <- newTBQueueIO qSize
   procThreads <- newTVarIO 0
+  fwdWorkers <- newTVarIO IM.empty
   endThreads <- newTVarIO IM.empty
   endThreadSeq <- newTVarIO 0
   connected <- newTVarIO True
@@ -524,6 +534,7 @@ newClient clientId qSize clientTHParams createdAt = do
         sndQ,
         msgQ,
         procThreads,
+        fwdWorkers,
         endThreads,
         endThreadSeq,
         clientTHParams,

@@ -11,6 +11,7 @@ import CoreTests.CryptoFileTests
 import CoreTests.CryptoTests
 import CoreTests.EncodingTests
 import CoreTests.EthCryptoTests
+import CoreTests.LockTests
 import CoreTests.MsgStoreTests
 import CoreTests.RetryIntervalTests
 import CoreTests.SOCKSSettings
@@ -54,6 +55,7 @@ import CoreTests.XFTPStoreTests (xftpStoreTests, xftpMigrationTests)
 import NtfServerTests (ntfServerTests)
 import NtfClient (ntfTestServerDBConnectInfo, ntfTestServerDBOpts)
 import SMPClient (testServerDBConnectInfo, testServerDBOpts)
+import SMPProxyTests (smpProxyPostgresTests)
 import Simplex.Messaging.Notifications.Server.Store.Migrations (ntfServerMigrations)
 import Simplex.Messaging.Server.QueueStore.Postgres.Migrations (serverMigrations)
 import XFTPClient (testXFTPDBConnectInfo)
@@ -73,6 +75,7 @@ main = do
   withGlobalLogging logCfg $ do
     setEnv "APNS_KEY_ID" "H82WD9K9AQ"
     setEnv "APNS_KEY_FILE" "./tests/fixtures/AuthKey_H82WD9K9AQ.p8"
+    setEnv "SYSTEM_CERTIFICATE_PATH" "./tests/fixtures/ca.crt"
     hspecInTmpDir
 #if defined(dbPostgres)
       . aroundAll_ (postgressBracket testDBConnectInfo)
@@ -117,8 +120,9 @@ main = do
           describe "Notifications server (SMP server: postgres-only store)" $
             ntfServerTests (transport @TLS, ASType SQSPostgres SMSPostgres)
           describe "SMP client agent, server postgres-only message store" $ agentTests (transport @TLS, ASType SQSPostgres SMSPostgres)
-          describe "SMP proxy, postgres-only message store" $
+          describe "SMP proxy, postgres-only message store" $ do
             before (pure $ ASType SQSPostgres SMSPostgres) smpProxyTests
+            smpProxyPostgresTests
 #endif
           describe "SMP client agent, server memory message store" $ agentTests (transport @TLS, ASType SQSMemory SMSMemory)
           describe "SMP proxy, memory message store" $
@@ -141,7 +145,9 @@ main = do
           describe "XRCP" remoteControlTests
           describe "Web" webTests
         sequential $ do
-          describe "Core tests" $ describe "Retry interval tests" retryIntervalTests
+          describe "Core tests" $ do
+            describe "Retry interval tests" retryIntervalTests
+            describe "Lock tests" lockTests
 #if defined(dbServerPostgres)
           describe "SMP server via TLS, postgres-only message store" $
             before (pure (transport @TLS, ASType SQSPostgres SMSPostgres)) $ describe "Timing of AUTH error" testTiming

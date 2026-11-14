@@ -263,7 +263,7 @@ import Simplex.Messaging.Agent.Store.DB (Binary (..), FromField (..), ToField (.
 import Simplex.Messaging.Encoding
 import Simplex.Messaging.Encoding.String
 import Simplex.Messaging.Parsers (parseAll, parseString)
-import Simplex.Messaging.Util (packZipWith, (<$?>))
+import Simplex.Messaging.Util (packZipWith, stateTVar', (<$?>))
 
 -- | Cryptographic algorithms.
 data Algorithm = Ed25519 | Ed448 | X25519 | X448
@@ -737,7 +737,7 @@ newRandom :: IO (TVar ChaChaDRG)
 newRandom = newTVarIO =<< drgNew
 
 newRandomDRG :: TVar ChaChaDRG -> STM (TVar ChaChaDRG)
-newRandomDRG g = newTVar =<< stateTVar g (`withDRG` drgNew)
+newRandomDRG g = newTVar =<< stateTVar' g (`withDRG` drgNew)
 
 generateAKeyPair :: AlgorithmI a => SAlgorithm a -> TVar ChaChaDRG -> STM AKeyPair
 generateAKeyPair a g = bimap (APublicKey a) (APrivateKey a) <$> generateKeyPair g
@@ -755,7 +755,7 @@ generateDhKeyPair :: (AlgorithmI a, DhAlgorithm a) => SAlgorithm a -> TVar ChaCh
 generateDhKeyPair a g = bimap (APublicDhKey a) (APrivateDhKey a) <$> generateKeyPair g
 
 generateKeyPair :: forall a. AlgorithmI a => TVar ChaChaDRG -> STM (KeyPair a)
-generateKeyPair g = stateTVar g (`withDRG` generateKeyPair_)
+generateKeyPair g = stateTVar' g (`withDRG` generateKeyPair_)
 
 generateKeyPair_ :: forall a. AlgorithmI a => MonadPseudoRandom ChaChaDRG (KeyPair a)
 generateKeyPair_ = do
@@ -763,7 +763,7 @@ generateKeyPair_ = do
   pure (toPublic pk, pk)
 
 generatePrivateKey :: forall a. AlgorithmI a => TVar ChaChaDRG -> STM (PrivateKey a)
-generatePrivateKey g = stateTVar g (`withDRG` generatePrivateKey_)
+generatePrivateKey g = stateTVar' g (`withDRG` generatePrivateKey_)
 
 generatePrivateKey_ :: forall a. AlgorithmI a => MonadPseudoRandom ChaChaDRG (PrivateKey a)
 generatePrivateKey_ = case sAlgorithm @a of
@@ -1447,7 +1447,7 @@ randomBytes = randomBytes'
 {-# INLINE randomBytes #-}
 
 randomBytes' :: ByteArray a => Int -> TVar ChaChaDRG -> STM a
-randomBytes' n gVar = stateTVar gVar $ randomBytesGenerate n
+randomBytes' n gVar = stateTVar' gVar $ randomBytesGenerate n
 {-# INLINE randomBytes' #-}
 
 reverseNonce :: CbNonceI n => n -> CbNonce
