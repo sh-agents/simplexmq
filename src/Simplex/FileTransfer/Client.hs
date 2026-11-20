@@ -172,7 +172,7 @@ xftpClientHandshakeV1 serverVRange keyHash@(C.KeyHash kh) c@HTTP2Client {session
     getServerHandshake = do
       let helloReq = H.requestNoBody "POST" "/" []
       HTTP2Response {respBody = HTTP2Body {bodyHead = shsBody}} <-
-        liftError' xftpClientError $ sendRequest c helloReq Nothing
+        liftError' xftpClientError $ sendRequest c helloReq Nothing pure
       liftTransportErr (TEHandshake PARSE) . smpDecode =<< liftTransportErr TEBadBlock (C.unPad shsBody)
     processServerHandshake :: XFTPServerHandshake -> ExceptT XFTPClientError IO (VersionRangeXFTP, C.PublicKeyX25519)
     processServerHandshake XFTPServerHandshake {xftpVersionRange, sessionId = serverSessId, authPubKey = serverAuth} = do
@@ -191,7 +191,7 @@ xftpClientHandshakeV1 serverVRange keyHash@(C.KeyHash kh) c@HTTP2Client {session
     sendClientHandshake chs = do
       chs' <- liftTransportErr TELargeMsg $ C.pad (smpEncode chs) xftpBlockSize
       let chsReq = H.requestBuilder "POST" "/" [] $ byteString chs'
-      HTTP2Response {respBody = HTTP2Body {bodyHead}} <- liftError' xftpClientError $ sendRequest c chsReq Nothing
+      HTTP2Response {respBody = HTTP2Body {bodyHead}} <- liftError' xftpClientError $ sendRequest c chsReq Nothing pure
       unless (B.null bodyHead) $ throwE $ PCETransportError TEBadBlock
     liftTransportErr e = liftEitherWith (const $ PCETransportError e)
 
@@ -234,7 +234,7 @@ sendXFTPTransmission :: XFTPClient -> ByteString -> Maybe XFTPChunkSpec -> Excep
 sendXFTPTransmission XFTPClient {config, thParams, http2Client} t chunkSpec_ = do
   let req = H.requestStreaming N.methodPost "/" [] streamBody
       reqTimeout = xftpReqTimeout config $ (\XFTPChunkSpec {chunkSize} -> chunkSize) <$> chunkSpec_
-  HTTP2Response {respBody = body@HTTP2Body {bodyHead}} <- withExceptT xftpClientError . ExceptT $ sendRequest http2Client req (Just reqTimeout)
+  HTTP2Response {respBody = body@HTTP2Body {bodyHead}} <- withExceptT xftpClientError . ExceptT $ sendRequest http2Client req (Just reqTimeout) pure
   when (B.length bodyHead /= xftpBlockSize) $ throwE $ PCEResponseError BLOCK
   -- TODO validate that the file ID is the same as in the request?
   (_, _fId, respOrErr) <- liftEither $ first PCEResponseError $ xftpDecodeTClient thParams bodyHead

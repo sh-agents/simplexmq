@@ -186,12 +186,13 @@ getVerifiedHTTP2ClientWith config host port disconnected setup =
 closeHTTP2Client :: HTTP2Client -> IO ()
 closeHTTP2Client = mapM_ uninterruptibleCancel . action
 
-sendRequest :: HTTP2Client -> Request -> Maybe Int -> IO (Either HTTP2ClientError HTTP2Response)
-sendRequest HTTP2Client {client_ = HClient {config, reqQ}} req reqTimeout_ = do
+sendRequest :: HTTP2Client -> Request -> Maybe Int -> (HTTP2Response -> IO a) -> IO (Either HTTP2ClientError a)
+sendRequest HTTP2Client {client_ = HClient {config, reqQ}} req reqTimeout_ handleResponse = do
   resp <- newEmptyTMVarIO
   atomically $ writeTBQueue reqQ (req, resp)
   let reqTimeout = http2RequestTimeout config reqTimeout_
-  maybe (Left HCResponseTimeout) Right <$> (reqTimeout `timeout` atomically (takeTMVar resp))
+  r <- reqTimeout `timeout` atomically (takeTMVar resp)
+  maybe (Left HCResponseTimeout) Right <$> mapM handleResponse r
 
 -- | this function should not be used until HTTP2 is thread safe, use sendRequest
 sendRequestDirect :: HTTP2Client -> Request -> Maybe Int -> IO (Either HTTP2ClientError HTTP2Response)
