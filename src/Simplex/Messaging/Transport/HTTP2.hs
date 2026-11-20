@@ -5,6 +5,8 @@ module Simplex.Messaging.Transport.HTTP2
   ( HTTP2Body (..),
     HTTP2BodyChunk (..),
     defaultHTTP2BufferSize,
+    http2MaxConcurrentStreams,
+    http2WindowSize,
     withHTTP2,
     http2TLSParams,
     getHTTP2Body,
@@ -50,6 +52,12 @@ allocHTTP2Config c sz = do
         confMySockAddr = SockAddrInet 0 0,
         confPeerSockAddr = SockAddrInet 0 0
       }
+
+http2MaxConcurrentStreams :: Int
+http2MaxConcurrentStreams = 100
+
+http2WindowSize :: Int
+http2WindowSize = 1048575
 
 http2TLSParams :: T.Supported
 http2TLSParams =
