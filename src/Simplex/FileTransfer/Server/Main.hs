@@ -435,6 +435,7 @@ cliCommandP cfgPath logPath iniFile =
       pure InitOptions {enableStoreLog, signAlgorithm, ip, fqdn, filesPath, fileSizeQuota, webStaticPath}
     startOptsP :: Parser StartOptions
     startOptsP = do
+      _ <- switch (long "maintenance")
       confirmMigrations <-
         option
           parseConfirmMigrations
