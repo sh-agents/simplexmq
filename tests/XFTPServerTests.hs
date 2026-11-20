@@ -23,16 +23,18 @@ import Data.ByteString.Char8 (ByteString)
 import qualified Data.ByteString.Char8 as B
 import qualified Data.ByteString.Lazy.Char8 as LB
 import qualified Data.CaseInsensitive as CI
-import Data.Either (isLeft)
+import Data.Either (isLeft, isRight)
 import Data.List (find, isInfixOf)
 import Data.List.NonEmpty (NonEmpty)
 import Data.Time.Clock (getCurrentTime)
 import qualified Data.X509 as X
 import Data.X509.Validation (Fingerprint (..), getFingerprint)
+import Network.HPACK (Header, defaultDynamicTableSize, defaultEncodeStrategy, encodeHeader, newDynamicTableForEncoding)
 import Network.HPACK.Token (tokenKey)
 import qualified Network.HTTP2.Client as H2
+import Network.HTTP2.Frame (ErrorCode (EnhanceYourCalm, NoError), FrameFlags, FrameHeader (..), FramePayload (..), FrameType (FrameGoAway, FrameHeaders, FramePing, FrameSettings, FrameWindowUpdate), SettingsKey (SettingsInitialWindowSize, SettingsMaxConcurrentStreams), StreamId, connectionPreface, connectionPrefaceLength, decodeFrameHeader, decodeFramePayload, defaultPayloadLength, defaultWindowSize, encodeFrame, encodeInfo, frameHeaderLength, setAck, setEndHeader, setEndStream, testAck)
 import qualified Network.TLS as T
-import SMPClient (copyWebCredential, testCredentialCheckInterval, testWebCredentialReload, testWebCredentialReplaced, testWebCredentials, withStallingServerOn')
+import SMPClient (copyWebCredential, serverBracket, testCredentialCheckInterval, testWebCredentialReload, testWebCredentialReplaced, testWebCredentials, withStallingServerOn')
 import ServerTests (logSize)
 import Simplex.FileTransfer.Client hiding (createXFTPChunk)
 import qualified Simplex.FileTransfer.Client as A
@@ -46,17 +48,17 @@ import qualified Simplex.Messaging.Crypto.Lazy as LC
 import Simplex.Messaging.Encoding (smpDecode, smpEncode)
 import Simplex.Messaging.Protocol (BasicAuth, EntityId (..), RecipientId, SenderId, pattern NoEntity)
 import Simplex.Messaging.Server.Expiration (ExpirationConfig (..))
-import Simplex.Messaging.Transport (CertChainPubKey (..), TLS (..), TransportPeer (..), defaultSupportedParams, defaultSupportedParamsHTTPS)
+import Simplex.Messaging.Transport (CertChainPubKey (..), TLS (..), Transport (cGet, cPut), TransportPeer (..), defaultSupportedParams, defaultSupportedParamsHTTPS)
 import Simplex.Messaging.Transport.Client (TransportClientConfig (..), TransportHost (..), defaultTransportClientConfig, runTLSTransportClient)
-import Simplex.Messaging.Transport.HTTP2 (HTTP2Body (..))
+import Simplex.Messaging.Transport.HTTP2 (HTTP2Body (..), defaultHTTP2BufferSize, http2MaxConcurrentStreams, http2WindowSize)
 import qualified Simplex.Messaging.Transport.HTTP2.Client as HC
-import Simplex.Messaging.Transport.Server (TransportServerConfig (..), loadFileFingerprint, loadServerCredential)
+import Simplex.Messaging.Transport.Server (TransportServerConfig (..), loadFileFingerprint, loadServerCredential, runTransportServer)
 import Simplex.Messaging.Transport.Shared (ChainCertificates (..), chainIdCaCerts)
 import Simplex.Messaging.Version (mkVersionRange)
 import System.Directory (listDirectory, removeFile)
 import System.FilePath ((</>))
 import Test.Hspec hiding (fit, it)
-import UnliftIO.Async (async, cancel, pooledReplicateConcurrentlyN, race_)
+import UnliftIO.Async (async, cancel, pooledReplicateConcurrentlyN, race_, wait, withAsync)
 import UnliftIO.STM
 import UnliftIO.Timeout (timeout)
 import Util
@@ -88,6 +90,9 @@ xftpServerTests = do
       it "should close connection when handshake times out" testHandshakeTimeout
       it "should close connection when cancelled during handshake" testCancelledHandshake
       it "should decode handshake of servers before v6.5.0 and refuse an invalid signature" testOldServerHandshake
+      it "should close connection when DATA exceeds the HTTP/2 flow-control window" testHTTP2FlowControl
+      it "should disconnect HTTP/2 client after GOAWAY of the server with the connection kept open" $ testHTTP2ClientGoAway True
+      it "should disconnect HTTP/2 client after GOAWAY of the server with the connection closed" $ testHTTP2ClientGoAway False
     describe "XFTP SNI and CORS" $ beforeWith (const (pure ())) $ do
       it "should select web certificate when SNI is used" testSNICertSelection
       it "should select XFTP certificate when SNI is not used" testNoSNICertSelection
@@ -454,6 +459,91 @@ testOldServerHandshake _ = do
   isLeft (decode $ smpEncode ("invalid" :: ByteString)) `shouldBe` True
   where
     XFTPServerConfig {xftpCredentials} = testXFTPServerConfig
+
+testHTTP2FlowControl :: HasTestEnv => AFStoreType -> Expectation
+testHTTP2FlowControl _ =
+  withStallingXFTPServer $ \requested _ -> do
+    Fingerprint fp <- loadFileFingerprint "tests/fixtures/ca.crt"
+    runTLSTransportClient defaultSupportedParams Nothing defaultTransportClientConfig Nothing "localhost" xftpTestPort (Just $ C.KeyHash fp) $ \(tls :: TLS 'TClient) -> do
+      cPut tls $ connectionPreface <> h2Frame 0 id (SettingsFrame [])
+      SettingsFrame settings <- awaitH2Frame tls "SETTINGS" $ \typ h -> typ == FrameSettings && not (testAck $ flags h)
+      (lookup SettingsMaxConcurrentStreams settings, lookup SettingsInitialWindowSize settings) `shouldBe` (Just http2MaxConcurrentStreams, Just http2WindowSize)
+      cPut tls $ h2Frame 0 setAck (SettingsFrame [])
+      awaitH2Frame tls "WINDOW_UPDATE" (\typ h -> typ == FrameWindowUpdate && streamId h == 0) `shouldReturn` WindowUpdateFrame (http2WindowSize - defaultWindowSize)
+      hdrs <- h2HeaderBlock [(":method", "POST"), (":scheme", "https"), (":authority", "localhost"), (":path", "/")]
+      cPut tls $ h2Frame 1 setEndHeader (HeadersFrame Nothing hdrs)
+      timeout h2FrameTimeout (atomically $ takeTMVar requested) `shouldReturn` Just ()
+      let (blocks, rest) = http2WindowSize `divMod` defaultPayloadLength
+          sendWindow = do
+            replicateM_ blocks $ cPut tls $ h2Frame 1 id $ DataFrame $ B.replicate defaultPayloadLength 'x'
+            cPut tls $ h2Frame 1 id $ DataFrame $ B.replicate rest 'x'
+      timeout h2FrameTimeout sendWindow `shouldReturn` Just ()
+      cPut tls $ h2Frame 0 id $ PingFrame "flowctrl"
+      awaitH2Frame tls "PING ack" (\typ h -> typ == FramePing && testAck (flags h)) `shouldReturn` PingFrame "flowctrl"
+      cPut tls $ h2Frame 1 id $ DataFrame "x"
+      awaitH2Frame tls "GOAWAY" (\typ _ -> typ == FrameGoAway) `shouldReturn` GoAwayFrame 1 EnhanceYourCalm "exceeds connection flow-control limit"
+
+testHTTP2ClientGoAway :: HasTestEnv => Bool -> AFStoreType -> Expectation
+testHTTP2ClientGoAway keepOpen _ = do
+  credential <- loadServerCredential xftpCredentials
+  disconnected <- newEmptyTMVarIO
+  requested <- newEmptyTMVarIO
+  let server (tls :: TLS 'TServer) = do
+        _ <- cGet tls connectionPrefaceLength
+        cPut tls $ h2Frame 0 id (SettingsFrame [])
+        settings <- awaitH2Frame tls "client SETTINGS" $ \typ h -> typ == FrameSettings && not (testAck $ flags h)
+        windowUpdate <- awaitH2Frame tls "client WINDOW_UPDATE" $ \typ h -> typ == FrameWindowUpdate && streamId h == 0
+        _ <- awaitH2Frame tls "request HEADERS" $ \typ h -> typ == FrameHeaders && streamId h == 1
+        atomically $ putTMVar requested (settings, windowUpdate)
+        cPut tls $ h2Frame 0 id (GoAwayFrame 1 NoError "")
+        when keepOpen $ do
+          hdrs <- h2HeaderBlock [(":status", "200")]
+          cPut tls $ h2Frame 1 (setEndStream . setEndHeader) (HeadersFrame Nothing hdrs)
+          threadDelay maxBound
+  serverBracket
+    (\started -> runTransportServer started xftpTestPort defaultSupportedParams credential transportConfig server)
+    (pure ())
+    $ \_ -> do
+      Fingerprint fp <- loadFileFingerprint "tests/fixtures/ca.crt"
+      runTLSTransportClient defaultSupportedParams Nothing defaultTransportClientConfig Nothing "localhost" xftpTestPort (Just $ C.KeyHash fp) $ \(tls :: TLS 'TClient) ->
+        bracket (either (error . show) pure =<< HC.attachHTTP2Client HC.defaultHTTP2ClientConfig (THDomainName "localhost") xftpTestPort (void . atomically $ tryPutTMVar disconnected ()) defaultHTTP2BufferSize tls) HC.closeHTTP2Client $ \h2 ->
+          withAsync (HC.sendRequest h2 (H2.requestNoBody "GET" "/" []) Nothing (\_ -> pure ())) $ \response -> do
+            clientFrames <- timeout h2FrameTimeout (atomically $ takeTMVar requested)
+            case clientFrames of
+              Just (SettingsFrame settings, windowUpdate) -> do
+                (lookup SettingsMaxConcurrentStreams settings, lookup SettingsInitialWindowSize settings) `shouldBe` (Just http2MaxConcurrentStreams, Just http2WindowSize)
+                windowUpdate `shouldBe` WindowUpdateFrame (http2WindowSize - defaultWindowSize)
+              r -> expectationFailure $ "no request: " <> show r
+            timeout h2FrameTimeout (atomically $ readTMVar disconnected) `shouldReturn` Just ()
+            when keepOpen $ timeout h2FrameTimeout (wait response) >>= (`shouldSatisfy` maybe False isRight)
+  where
+    XFTPServerConfig {xftpCredentials, transportConfig} = testXFTPServerConfig
+
+h2FrameTimeout :: Int
+h2FrameTimeout = 5000000
+
+h2Frame :: StreamId -> (FrameFlags -> FrameFlags) -> FramePayload -> ByteString
+h2Frame sid setFlags = encodeFrame (encodeInfo setFlags sid)
+
+h2HeaderBlock :: [Header] -> IO ByteString
+h2HeaderBlock hs = do
+  dynTable <- newDynamicTableForEncoding defaultDynamicTableSize
+  encodeHeader defaultEncodeStrategy h2HeaderBufferSize dynTable hs
+
+h2HeaderBufferSize :: Int
+h2HeaderBufferSize = 4096
+
+awaitH2Frame :: TLS p -> String -> (FrameType -> FrameHeader -> Bool) -> IO FramePayload
+awaitH2Frame tls name wanted = timeout h2FrameTimeout nextFrame >>= maybe (error $ "no " <> name <> " frame within " <> show h2FrameTimeout <> " microseconds") pure
+  where
+    nextFrame = do
+      (typ, h) <- decodeFrameHeader <$> cGet tls frameHeaderLength
+      payload <- either (error . show) pure . decodeFramePayload typ h =<< cGet tls (payloadLength h)
+      if wanted typ h
+        then pure payload
+        else case payload of
+          GoAwayFrame {} -> error $ "unexpected " <> show payload
+          _ -> nextFrame
 
 -- SNI and CORS tests
 
