@@ -11,6 +11,7 @@ module Simplex.FileTransfer.Server.Store
   ( FSType (..),
     SFSType (..),
     FileStoreClass (..),
+    addRecipients,
     FileRec (..),
     FileRecipient (..),
     STMFileStore (..),
@@ -23,8 +24,10 @@ import Data.Kind (Type)
 
 import Control.Concurrent.STM
 import Control.Monad
+import Control.Monad.Trans.Except (ExceptT (..), runExceptT)
 import qualified Data.Attoparsec.ByteString.Char8 as A
 import Data.Int (Int64)
+import Data.List.NonEmpty (NonEmpty)
 import qualified Data.Map.Strict as M
 import Data.Maybe (catMaybes, isJust)
 import Data.Set (Set)
@@ -88,6 +91,9 @@ class FileStoreClass s where
   expiredFiles :: s -> SystemSeconds -> Int64 -> Int -> IO [(SenderId, Maybe FilePath, Word32)]
   getUsedStorage :: s -> IO Int64
   getFileCount :: s -> IO Int
+
+addRecipients :: FileStoreClass s => s -> SenderId -> NonEmpty FileRecipient -> IO (Either XFTPErrorType ())
+addRecipients st sId = runExceptT . mapM_ (ExceptT . addRecipient st sId)
 
 -- STM in-memory store
 

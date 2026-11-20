@@ -500,7 +500,7 @@ processXFTPRequest ent HTTP2Body {bodyPart} = \case
         XFTPServerConfig {allowNewFiles, newFileBasicAuth} <- asks config
         pure $ allowNewFiles && maybe True ((== auth) . Just) newFileBasicAuth
   XFTPReqCmd fId fr (FileCmd _ cmd) -> case cmd of
-    FADD rks -> noFile =<< addRecipients fId rks
+    FADD rks -> noFile =<< addFileRecipients fId rks
     FPUT -> noFile =<< receiveServerFile fr
     FDEL -> noFile =<< deleteServerFile fr
     FGET rDhKey -> sendServerFile fr rDhKey
@@ -561,8 +561,8 @@ processXFTPRequest ent HTTP2Body {bodyPart} = \case
       liftIO (add fId) >>= \case
         Left DUPLICATE_ -> retryAdd (n - 1) add
         r -> pure r
-    addRecipients :: XFTPFileId -> NonEmpty RcvPublicAuthKey -> M s FileResponse
-    addRecipients sId rks = do
+    addFileRecipients :: XFTPFileId -> NonEmpty RcvPublicAuthKey -> M s FileResponse
+    addFileRecipients sId rks = do
       st <- asks fileStore
       r <- runExceptT $ do
         rcps <- mapM (ExceptT . addRecipientRetry st 3 sId) rks
