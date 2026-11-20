@@ -73,6 +73,7 @@ import GHC.IO.Exception (IOException, ioe_errno)
 import Network.Socket
 import qualified Network.TLS as T
 import Simplex.Messaging.Transport
+import Simplex.Messaging.Transport.KeepAlive (KeepAliveOpts)
 import Simplex.Messaging.Transport.Shared
 import Simplex.Messaging.Util (catchAll_, labelMyThread, stateTVar', tshow, unlessM)
 import System.Exit (exitFailure)
@@ -90,6 +91,9 @@ data TransportServerConfig = TransportServerConfig
     addCORSHeaders :: Bool,
     tlsSetupTimeout :: Int,
     transportTimeout :: Int,
+    firstRequestTimeout :: Int,
+    tcpKeepAlive :: Maybe KeepAliveOpts,
+    tcpUserTimeout :: Maybe Int,
     credentialCheckInterval :: Int
   }
   deriving (Eq, Show)
@@ -144,6 +148,9 @@ mkTransportServerConfig logTLSErrors serverALPN askClientCert =
       addCORSHeaders = False,
       tlsSetupTimeout = 60000000,
       transportTimeout = 40000000,
+      firstRequestTimeout = 60000000,
+      tcpKeepAlive = Nothing,
+      tcpUserTimeout = Nothing,
       credentialCheckInterval = defaultCredentialCheckInterval
     }
 
